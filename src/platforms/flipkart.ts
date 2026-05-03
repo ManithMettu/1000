@@ -3,100 +3,186 @@ import type { ProductPayload } from "../types";
 import { emptyProduct } from "../types";
 import { classifyOfferText, dedupeOffers, textOrNull } from "../utils/parser";
 
-async function closeLoginPopup(page: Page): Promise<void> {
-  const candidates = [
-    'button:has-text("✕")',
-    '[class*="close"]',
-    'button[aria-label="Close"]',
-    'div:has-text("Login") >> .. >> button',
-  ];
-  for (const sel of candidates) {
-    const b = page.locator(sel).first();
-    if (await b.isVisible().catch(() => false)) {
-      await b.click({ timeout: 2000 }).catch(() => {});
-      break;
-    }
-  }
+/** Dismiss overlay/login popup quickly. */
+async function closePopup(page: Page): Promise<void> {
   await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(100);
 }
 
-async function collectOfferTexts(page: Page): Promise<string[]> {
-  const texts: string[] = [];
-  const panels = page.locator('[class*="offer"], [class*="OFFER"], ._16FRpwa, .yoqnHx');
-  const n = await panels.count().catch(() => 0);
-  for (let i = 0; i < Math.min(n, 40); i++) {
-    const t = await panels.nth(i).innerText().catch(() => "");
-    t.split("\n").forEach((line) => {
-      const s = line.trim();
-      if (s.length > 4) texts.push(s);
-    });
-  }
-  return texts;
+interface FlipkartLD {
+  name?: string;
+  description?: string;
+  image?: string[];
+  color?: string;
+  brand?: { name?: string };
+  aggregateRating?: { ratingValue?: number; ratingCount?: number; reviewCount?: number };
+  offers?: { price?: number; priceCurrency?: string; availability?: string };
 }
 
 export async function scrapeFlipkart(page: Page): Promise<ProductPayload> {
   const p = emptyProduct("flipkart");
-  await closeLoginPopup(page);
+  await closePopup(page);
 
-  const title = await page.locator("span.B_NuCI, h1 span").first().innerText().catch(() => "");
-  p.title = textOrNull(title);
-
-  const price = await page.locator("div._30jeq3, div._25b18c").first().innerText().catch(() => "");
-  p.price = textOrNull(price);
-
-  const orig = await page.locator("div._3I9_wc, ._3Ay6Sb + span").first().innerText().catch(() => "");
-  p.original_price = textOrNull(orig);
-
-  const disc = await page.locator("div._3Ay6Sb span").first().innerText().catch(() => "");
-  p.discount = textOrNull(disc);
-
-  const imgs = await page.evaluate(() => {
-    const out: string[] = [];
-    document.querySelectorAll('img[src*="rukmini"], ._396cs4, li._3qtDIv img').forEach((el) => {
-      const u = (el as HTMLImageElement).src;
-      if (u && u.startsWith("http")) out.push(u);
-    });
-    return [...new Set(out)];
+  /* ── 1. JSON-LD structured data (most reliable, immune to DOM changes) ── */
+  const ld: FlipkartLD | null = await page.evaluate(() => {
+    const scripts = Array.from(
+      document.querySelectorAll('script[type="application/ld+json"]')
+    );
+    for (const s of scripts) {
+      try {
+        const data = JSON.parse(s.textContent || "");
+        const items = Array.isArray(data) ? data : [data];
+        for (const item of items) {
+          if (item["@type"] === "Product" && item.name) return item as FlipkartLD;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    return null;
   });
-  p.images = imgs;
 
-  const rating = await page.locator("div._3LWZlK").first().innerText().catch(() => "");
-  p.rating = textOrNull(rating);
+  if (ld) {
+    p.title = textOrNull(ld.name || "");
+    if (ld.offers?.price != null) p.price = `₹${ld.offers.price}`;
+    if (ld.aggregateRating?.ratingValue != null)
+      p.rating = String(ld.aggregateRating.ratingValue);
+    if (ld.aggregateRating?.ratingCount != null)
+      p.reviews_count = `${ld.aggregateRating.ratingCount.toLocaleString("en-IN")} ratings`;
+    if (Array.isArray(ld.image)) p.images = ld.image.filter(Boolean);
+    if (ld.offers?.availability) {
+      p.availability = ld.offers.availability.includes("OutOfStock")
+        ? "Out of Stock"
+        : "In Stock";
+    }
+    /* Extract MRP from description: "only for Rs.NNNN.0 from Flipkart" */
+    const mrpMatch = (ld.description || "").match(/Rs\.?\s*([\d,]+(?:\.\d+)?)/i);
+    if (mrpMatch) {
+      const raw = mrpMatch[1].replace(/\.0+$/, "").replace(/\.(\d)$/, "");
+      p.original_price = `₹${raw}`;
+    }
+    /* Calculate discount from price + MRP */
+    if (ld.offers?.price != null && p.original_price) {
+      const curr = ld.offers.price;
+      const mrp = parseFloat(p.original_price.replace(/[₹,]/g, ""));
+      if (mrp > curr) p.discount = `${Math.round((1 - curr / mrp) * 100)}% off`;
+    }
+  }
 
-  const reviews = await page.locator("span._2_R_DZ span").first().innerText().catch(() => "");
-  p.reviews_count = textOrNull(reviews);
+  /* ── 2. DOM extraction for fields not in JSON-LD ─────────────────────── */
+  const dom = await page.evaluate(() => {
+    const text = (el: Element | null) =>
+      (el?.textContent || "").replace(/\s+/g, " ").trim();
 
-  const seller = await page.locator("#sellerName, ._14SellerName, span:has-text('Sold by')").first().innerText().catch(() => "");
-  p.seller = textOrNull(seller);
+    /* Remove the discount scan from DOM — we calculate it from JSON-LD fields above */
 
-  const highlights = await page
-    .locator("div._2aQIzr li, ._1UhVsV._3hqFK7 li")
-    .allInnerTexts()
-    .catch(() => [] as string[]);
-  p.highlights = highlights.map((x) => x.trim()).filter(Boolean);
+    /* Seller ("Sold by X") */
+    let seller: string | null = null;
+    const bodyText = document.body.textContent || "";
+    const sm = bodyText.match(/[Ss]old\s+by\s*[:\-]?\s*([^\n,•]{2,60})/);
+    if (sm) seller = sm[1].trim();
 
-  const specRows = await page.evaluate(() => {
-    const obj: Record<string, string> = {};
-    document.querySelectorAll("table tr._1UhVsV, ._14CfVK tr, table._14cfVK tr").forEach((tr) => {
-      const tds = tr.querySelectorAll("td, th");
-      if (tds.length >= 2) {
-        const k = (tds[0].textContent || "").trim();
-        const v = (tds[1].textContent || "").trim();
-        if (k && v) obj[k] = v;
+    /* Availability (more specific from DOM, overrides LD) */
+    let avail = "";
+    document.querySelectorAll("div, p, span").forEach((el) => {
+      if (!avail && !(el as HTMLElement).querySelector("*")) {
+        const t = text(el);
+        if (/out\s+of\s+stock|in\s+stock|delivery|ships?\s+in/i.test(t) && t.length < 120)
+          avail = t;
       }
     });
-    return obj;
+
+    /* Highlights — find "Highlights" heading → child li items */
+    const highlights: string[] = [];
+    document.querySelectorAll("p, span, div, h2, h3, h4").forEach((heading) => {
+      if (text(heading).trim().toLowerCase() === "highlights") {
+        const parent = heading.closest("section, div[class], article");
+        if (parent) {
+          parent.querySelectorAll("li").forEach((li) => {
+            const t = text(li);
+            if (t.length > 5 && t.length < 400) highlights.push(t);
+          });
+        }
+      }
+    });
+
+    /* Specs — table rows or "Specifications" heading → row pairs */
+    const specs: Record<string, string> = {};
+    document.querySelectorAll("table tr").forEach((tr) => {
+      const tds = tr.querySelectorAll("td, th");
+      if (tds.length >= 2) {
+        const k = text(tds[0]); const v = text(tds[1]);
+        if (k && v && k.length < 80) specs[k] = v;
+      }
+    });
+    document.querySelectorAll("p, span, div, h2, h3, h4").forEach((heading) => {
+      if (/^specifications?$/i.test(text(heading).trim())) {
+        const parent = heading.closest("section, div[class], article");
+        if (!parent) return;
+        parent.querySelectorAll("[class*='row' i], div > div").forEach((row) => {
+          const divs = row.querySelectorAll("div, td, span");
+          if (divs.length >= 2) {
+            const k = text(divs[0]); const v = text(divs[1]);
+            if (k && v && k.length < 80 && v.length < 200 && k !== v) specs[k] = v;
+          }
+        });
+      }
+    });
+
+    /* Reviews count (more detailed from DOM) */
+    let reviewsCount = "";
+    document.querySelectorAll("span, a, div, p").forEach((el) => {
+      if (!reviewsCount) {
+        const t = text(el);
+        const m = t.match(/([\d,]+)\s*(Ratings?|Reviews?)(\s*[&+]\s*\d[\d,]*\s*\w+)?/i);
+        if (m && t.length < 120) reviewsCount = m[0].trim();
+      }
+    });
+
+    /* Bank/card offers (text-content scan for genuine offer lines) */
+    const offerLines: string[] = [];
+    const genuineOfferRe =
+      /bank\s*offer|cashback|emi|axis|hdfc|icici|sbi|kotak|citi|rbl|yes\s*bank|amex|indusind|no\s*cost|extra\s*₹|instant\s*discount/i;
+    const adProductRe =
+      /^[A-Z]{4,}(\s[A-Za-z0-9]+){1,}\s*(Running|Sports|Shoes|Sneakers|Footwear|For\s*Men|For\s*Women)/;
+    /* Also skip lines starting with unknown all-caps brand names */
+    const capsStartRe = /^[A-Z]{5,}\s+[A-Z][a-z]/;
+    document.querySelectorAll("div, span, li, p").forEach((el) => {
+      if ((el as HTMLElement).querySelector("div, ul")) return;
+      const t = text(el);
+      if (t.length < 6 || t.length > 250) return;
+      if (!genuineOfferRe.test(t)) return;
+      if (adProductRe.test(t)) return;
+      if (capsStartRe.test(t)) return;
+      offerLines.push(t);
+    });
+
+    return {
+      seller,
+      avail,
+      highlights: highlights.slice(0, 30),
+      specs,
+      reviewsCount,
+      offerLines: offerLines.slice(0, 60),
+    };
   });
-  p.specifications = specRows;
 
-  const moreDesc = await page.locator("div._1mXcCf, #productDescription").first().innerText().catch(() => "");
-  if (moreDesc) p.additional_details["description"] = moreDesc.slice(0, 8000);
+  if (!p.price) {
+    /* Fallback: scan body for ₹NNN if JSON-LD had no price */
+    const fb = await page.evaluate(() => {
+      const m = (document.body.textContent || "").match(/₹\s*([\d,]+)/);
+      return m ? `₹${m[1]}` : "";
+    });
+    if (fb) p.price = fb;
+  }
 
-  const offerStrings = await collectOfferTexts(page);
-  p.offers = dedupeOffers(offerStrings.map((t) => classifyOfferText(t)));
-
-  const avail = await page.locator("div._16FRpwa:has-text('Delivery'), ._16FRpwa").first().innerText().catch(() => "");
-  p.availability = textOrNull(avail);
+  if (!p.discount) p.discount = null;
+  if (dom.seller) p.seller = dom.seller;
+  if (dom.avail) p.availability = dom.avail;
+  p.highlights = dom.highlights;
+  p.specifications = dom.specs;
+  if (dom.reviewsCount) p.reviews_count = dom.reviewsCount;
+  p.offers = dedupeOffers(dom.offerLines.map((t) => classifyOfferText(t)));
 
   return p;
 }

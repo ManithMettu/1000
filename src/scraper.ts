@@ -144,13 +144,19 @@ async function runPlaywright(
     await applyStealthScripts(context);
 
     const page = await context.newPage();
+    /* 3 s default: pages are already loaded before extraction, so 12 s stacks 40+ timeouts → multi-minute hangs. */
+    page.setDefaultTimeout(3_000);
+    page.setDefaultNavigationTimeout(50_000);
     activePage = page;
     attachPdpNavigationGuard(page, url, platform);
     const limits = interactionLimits(platform);
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    await page.waitForLoadState("load", { timeout: 25_000 }).catch(() => {});
-    if (platform === "meesho" || platform === "flipkart") {
+    /* Flipkart often never reaches network "load" (long-polling); avoid hanging here. */
+    if (platform !== "flipkart") {
+      await page.waitForLoadState("load", { timeout: 18_000 }).catch(() => {});
+    }
+    if (platform === "meesho") {
       await page.waitForURL(/\/p\//i, { timeout: 18_000 }).catch(() => {});
     }
     await assertNotBlocked(page);
@@ -250,6 +256,9 @@ export async function scrapeProduct(
         headed
       );
       if (!data.title && !data.price) throw new Error("Insufficient data from Playwright");
+      if (data.title && /^access\s+denied$|^403\b|^blocked$|^sorry/i.test(data.title.trim())) {
+        throw new Error(`Playwright returned a block page (title: "${data.title}"). Falling back.`);
+      }
       return { data, screenshot_path };
     });
 
@@ -264,6 +273,9 @@ export async function scrapeProduct(
     if (firstErr instanceof InvalidProductUrlError) throw firstErr;
     try {
       const data = await runCheerio(url, platform);
+      if (!data.title && !data.price) {
+        throw new Error("Cheerio fallback returned no product data — page may be blocked or requires JS");
+      }
       const result: ScrapeResult = { data, source: "cheerio", screenshot_path: null };
       cacheSet(url, result);
       return result;

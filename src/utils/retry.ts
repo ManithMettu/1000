@@ -1,6 +1,6 @@
 import { InvalidProductUrlError } from "./productUrl";
 
-export const MAX_SCRAPE_ATTEMPTS = 3;
+export const MAX_SCRAPE_ATTEMPTS = 2; // 1 initial + 1 retry; 3 retries × 30s = 90s hang
 
 export async function withRetry<T>(
   fn: (attempt: number) => Promise<T>,

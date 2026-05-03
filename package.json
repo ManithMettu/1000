@@ -6,7 +6,10 @@
   "scripts": {
     "build": "tsc",
     "start": "npm run build && node dist/server.js",
-    "test:sites": "npm run build && node dist/scripts/verify-scrape.js"
+    "test:sites": "npm run build && node dist/scripts/verify-scrape.js",
+    "test:amazon": "npm run build && node dist/scripts/test-one.js amazon",
+    "test:flipkart": "npm run build && node dist/scripts/test-one.js flipkart",
+    "test:meesho": "npm run build && node dist/scripts/test-one.js meesho"
   },
   "engines": {
     "node": ">=18"
