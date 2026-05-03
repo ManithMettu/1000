@@ -1,0 +1,25 @@
+{
+  "name": "product-scraper-microservice",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright-based product scraping API for Amazon, Flipkart, Meesho",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/server.js",
+    "test:sites": "npm run build && node dist/scripts/verify-scrape.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "express": "^4.21.2",
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2"
+  }
+}

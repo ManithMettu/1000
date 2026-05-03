@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Product Scraper</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>Product page scraper</h1>
+      <p class="sub">
+        Paste a <strong>single product</strong> link (not search or category). Example: Flipkart URLs
+        must include <code>/p/itm</code> in the path; Amazon must include <code>/dp/</code> and a
+        10-character ASIN. The app only opens the page you give it—listing pages have no full product
+        details to scrape.
+      </p>
+
+      <form id="form" class="card">
+        <label for="url">Product URL</label>
+        <input id="url" name="url" type="url" placeholder="https://..." required />
+
+        <label class="row">
+          <input id="shot" type="checkbox" />
+          Capture screenshot (saved on server)
+        </label>
+
+        <label class="row">
+          <input id="headed" type="checkbox" />
+          Show Chromium window (live) — runs on the machine where the API is started
+        </label>
+
+        <button type="submit" id="go">Scrape</button>
+      </form>
+
+      <p id="status" class="status" aria-live="polite"></p>
+      <pre id="out" class="out"></pre>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
