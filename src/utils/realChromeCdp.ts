@@ -1,24 +1,7 @@
-import { existsSync, mkdirSync } from "node:fs";
-import { homedir, platform } from "node:os";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { homedir, platform, tmpdir } from "node:os";
 import path from "node:path";
 import { chromium, type BrowserContext } from "playwright";
-
-/** Default profile dir per OS (override with `SCRAPER_CHROME_USER_DATA`). */
-function defaultChromeUserDataDir(): string {
-  const sys = platform();
-  if (sys === "win32") {
-    const base = process.env.LOCALAPPDATA || process.env.USERPROFILE || homedir();
-    return path.join(base, "product-scraper-chrome-profile");
-  }
-  if (sys === "darwin") {
-    return path.join(homedir(), "Desktop", "meesho_profile");
-  }
-  /* Linux and others: XDG-style path (no Desktop required). */
-  return path.join(homedir(), ".local", "share", "product-scraper-chrome-profile");
-}
-
-export const CHROME_USER_DATA_DIR =
-  process.env.SCRAPER_CHROME_USER_DATA ?? defaultChromeUserDataDir();
 
 /**
  * Resolves a real Chrome/Chromium binary. Checks env first, then common install locations.
@@ -80,34 +63,54 @@ function inferBrowserChannel(executablePath: string): "chrome" | "chromium" {
   return "chrome";
 }
 
-/**
- * Matches `scraper_service.py`: `launch_persistent_context` with real Chrome,
- * `headless=False` (unless `SCRAPER_CHROME_HEADLESS=1`), `no_viewport=True`,
- * and `args: --start-maximized`, `--disable-blink-features=AutomationControlled`.
- */
-export async function launchChromePersistentContext(): Promise<BrowserContext> {
-  mkdirSync(CHROME_USER_DATA_DIR, { recursive: true });
+export interface LaunchedChromePersistent {
+  context: BrowserContext;
+  /** Empty temp user-data dir; delete after `context.close()` so no profile is reused. */
+  userDataDir: string;
+}
 
-  const headless = process.env.SCRAPER_CHROME_HEADLESS === "1";
+/**
+ * `headed === true`: visible Chrome (e.g. UI checkbox “Show Chrome window (live)”).
+ * `headed === false`: headless in the background (`headless: true`).
+ * Always uses a **new** temp profile directory (never reuses `~/Desktop/meesho_profile` or similar).
+ */
+export async function launchChromePersistentContext(headed: boolean): Promise<LaunchedChromePersistent> {
+  const userDataDir = mkdtempSync(path.join(tmpdir(), "product-scraper-chrome-"));
+
+  const headless = !headed;
   const exe = resolveChromeExecutable();
+
+  const args = headed
+    ? ["--start-maximized", "--disable-blink-features=AutomationControlled"]
+    : ["--disable-blink-features=AutomationControlled"];
 
   const common = {
     headless,
     viewport: null,
-    args: ["--start-maximized", "--disable-blink-features=AutomationControlled"],
+    args,
   };
 
-  if (exe) {
-    return chromium.launchPersistentContext(CHROME_USER_DATA_DIR, {
-      ...common,
-      executablePath: exe,
-      channel: inferBrowserChannel(exe),
-    });
-  }
+  try {
+    if (exe) {
+      const context = await chromium.launchPersistentContext(userDataDir, {
+        ...common,
+        executablePath: exe,
+        channel: inferBrowserChannel(exe),
+      });
+      return { context, userDataDir };
+    }
 
-  /* Let Playwright resolve Google Chrome from the OS (default installs). */
-  return chromium.launchPersistentContext(CHROME_USER_DATA_DIR, {
-    ...common,
-    channel: "chrome",
-  });
+    const context = await chromium.launchPersistentContext(userDataDir, {
+      ...common,
+      channel: "chrome",
+    });
+    return { context, userDataDir };
+  } catch (err) {
+    try {
+      rmSync(userDataDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 }

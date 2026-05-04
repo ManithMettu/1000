@@ -1,6 +1,13 @@
 /** Whether to open a real Chromium window (headed mode). */
 
-export function resolveHeaded(explicit?: boolean): boolean {
+export function resolveHeaded(explicit?: boolean | string | number): boolean {
+  if (explicit === false || explicit === 0 || explicit === "0") return false;
+  if (typeof explicit === "string" && explicit.trim().toLowerCase() === "false") return false;
+  if (explicit === true || explicit === 1 || explicit === "1") return true;
+  if (typeof explicit === "string") {
+    const s = explicit.trim().toLowerCase();
+    if (s === "true" || s === "yes") return true;
+  }
   if (typeof explicit === "boolean") return explicit;
   const h = process.env.SCRAPE_HEADED?.toLowerCase();
   if (h === "1" || h === "true" || h === "yes") return true;

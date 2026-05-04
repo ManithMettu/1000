@@ -143,10 +143,13 @@ async function runPlaywright(
 ): Promise<{ data: ProductPayload; screenshot_path: string | null }> {
   void proxy;
   let context: BrowserContext | null = null;
+  let chromeUserDataDir: string | null = null;
   let screenshot_path: string | null = null;
   let activePage: Page | undefined;
   try {
-    context = await launchChromePersistentContext();
+    const launched = await launchChromePersistentContext(headed);
+    context = launched.context;
+    chromeUserDataDir = launched.userDataDir;
     const headers = chromeLikeHeaders(userAgent);
     await context.setExtraHTTPHeaders(headers).catch(() => {});
     await applyStealthScripts(context);
@@ -195,6 +198,13 @@ async function runPlaywright(
       await activePage.waitForTimeout(pause).catch(() => {});
     }
     await context?.close().catch(() => {});
+    if (chromeUserDataDir) {
+      try {
+        fs.rmSync(chromeUserDataDir, { recursive: true, force: true });
+      } catch {
+        /* Windows may briefly lock files after close */
+      }
+    }
   }
 }
 
