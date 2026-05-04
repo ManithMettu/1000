@@ -1,6 +1,6 @@
 # Product scraper microservice
 
-TypeScript + Express API that uses **Playwright** (Chromium, headless) to scrape Amazon, Flipkart, and Meesho product pages with human-like scrolling, delays, and keyword-based expansion of offers and “see more” sections. If the browser path fails after retries, the service falls back to **axios + cheerio** for a best-effort static parse.
+TypeScript + Express API that uses **Playwright** (chrome, headless) to scrape Amazon, Flipkart, and Meesho product pages with human-like scrolling, delays, and keyword-based expansion of offers and “see more” sections. If the browser path fails after retries, the service falls back to **axios + cheerio** for a best-effort static parse.
 
 ## Install and run
 
@@ -53,6 +53,12 @@ The Chromium window opens on **the same computer that runs the Node server** (wh
 
 When **headed** mode is on, the browser stays open for **`SCRAPE_HEADED_PAUSE_MS`** milliseconds (default **3000**) after scraping so you can see the page before Chromium closes. Set to `0` to close immediately.
 
+### Proxy / IP rotation (optional)
+
+Set **`SCRAPE_PROXIES`** to a comma- or newline-separated list of proxy URLs (HTTP, HTTPS, SOCKS4, or SOCKS5), for example `http://user:pass@host:port` or `socks5://127.0.0.1:1080`. For a single proxy you can use **`SCRAPE_PROXY`** instead. Each **retry** uses the next proxy in the list (round-robin); the cheerio fallback uses the entry after the last Playwright attempt. If unset, traffic goes **direct** (no proxy).
+
+`GET /health` includes **`proxy_pool_size`**: the number of configured proxy URLs (not the URLs themselves).
+
 On a headless Linux server with no display, headed mode will fail unless you use X11 forwarding or a virtual framebuffer.
 
 Example:
@@ -87,7 +93,7 @@ Platform is inferred from the hostname:
 ```
 src/
   server.ts          Express, POST /scrape, static public/
-  scraper.ts         Cache, retries, UA rotation, Playwright flow, cheerio fallback
+  scraper.ts         Cache, retries, UA + optional proxy rotation, Playwright, cheerio fallback
   types.ts           Shared product shape + emptyProduct()
   platforms/
     amazon.ts        Amazon-specific DOM extraction
@@ -95,7 +101,8 @@ src/
     meesho.ts        Meesho tables and sections
   utils/
     cache.ts         In-memory TTL cache (5 minutes, keyed by URL)
-    retry.ts         withRetry (3 attempts = up to 2 retries after the first)
+    retry.ts         withRetry (2 attempts: initial + 1 retry)
+    proxyRotation.ts Env proxy list, round-robin per attempt (Playwright + axios fallback)
     userAgent.ts     Rotating desktop user agents
     parser.ts        Offer classification helpers
 public/
@@ -105,7 +112,7 @@ public/
 Flow:
 
 1. Check cache → return if fresh  
-2. Launch Chromium with a **rotated user agent** per attempt  
+2. Launch Chromium with a **rotated user agent** per attempt and an optional **rotating proxy** (`SCRAPE_PROXIES`)  
 3. Navigate, **scroll** to load lazy content, **click** elements whose text matches offer / “view all” / “see more” patterns  
 4. Run the **platform scraper** to build a normalized payload  
 5. On repeated failure (including “no title and no price”), **axios + cheerio** parses OG tags, visible prices, and coarse offer snippets  
@@ -124,7 +131,7 @@ Flow:
 
 - **Redis** (or Memcached) for distributed cache and TTL instead of in-process `Map`
 - **Job queue** (BullMQ, RabbitMQ, SQS) for async scrape jobs, rate limits, and long timeouts
-- **Residential / rotating proxies** and per-platform cookie jars to reduce blocks
+- **Per-platform cookie jars** (proxies are supported via `SCRAPE_PROXIES`; wire your provider’s rotating endpoints into that list)
 - **Structured extraction rules** stored in DB and updated without redeploying code
 - **Playwright stealth / fingerprint** tuning only where compliant with policy
 
@@ -138,4 +145,3 @@ Flow:
 
 ---
 
-MIT-style use: ensure compliance with each retailer’s terms and local regulations before production use.

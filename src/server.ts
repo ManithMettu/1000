@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import { detectPlatform, scrapeProduct } from "./scraper";
 import { InvalidProductUrlError } from "./utils/productUrl";
+import { countConfiguredProxies } from "./utils/proxyRotation";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -62,7 +63,7 @@ app.post("/scrape", async (req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, proxy_pool_size: countConfiguredProxies() });
 });
 
 app.listen(PORT, () => {

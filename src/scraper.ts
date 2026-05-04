@@ -2,7 +2,10 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import * as fs from "fs";
 import * as path from "path";
-import { chromium, type Page } from "playwright";
+import type { Agent } from "http";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
+import { type BrowserContext, type Page } from "playwright";
 import { scrapeAmazon } from "./platforms/amazon";
 import { scrapeFlipkart } from "./platforms/flipkart";
 import { scrapeMeesho } from "./platforms/meesho";
@@ -11,16 +14,23 @@ import { emptyProduct } from "./types";
 import { cacheGet, cacheSet } from "./utils/cache";
 import { chromeLikeHeaders } from "./utils/httpHeaders";
 import { classifyOfferText, dedupeOffers, textOrNull } from "./utils/parser";
-import { withRetry } from "./utils/retry";
-import { applyStealthScripts, CHROMIUM_LAUNCH_ARGS, looksLikeBlockedPage } from "./utils/stealth";
+import { getAxiosProxyUrlForAttempt, getPlaywrightProxyForAttempt } from "./utils/proxyRotation";
+import { MAX_SCRAPE_ATTEMPTS, withRetry } from "./utils/retry";
+import { applyStealthScripts, looksLikeBlockedPage } from "./utils/stealth";
 import { attachPdpNavigationGuard } from "./utils/navigationGuard";
 import {
   InvalidProductUrlError,
   assertHtmlLooksLikeFlipkartPdp,
   assertProductDetailUrl,
 } from "./utils/productUrl";
-import { resolveHeaded, resolveHeadedPauseMs, resolveSlowMoMs } from "./utils/browserEnv";
+import { resolveHeaded, resolveHeadedPauseMs } from "./utils/browserEnv";
+import { launchChromePersistentContext } from "./utils/realChromeCdp";
 import { getFallbackUserAgent, getPlaywrightUserAgent } from "./utils/userAgent";
+
+function httpAgentForProxyUrl(proxyUrl: string): Agent {
+  if (/^socks5?:\/\//i.test(proxyUrl)) return new SocksProxyAgent(proxyUrl);
+  return new HttpsProxyAgent(proxyUrl);
+}
 
 export interface ScrapeResult {
   data: ProductPayload;
@@ -86,7 +96,7 @@ async function clickExpandables(
   platform: ProductPayload["platform"]
 ): Promise<void> {
   const strong =
-    /view\s+all|see\s+more|available\s+offers|show\s+more|read\s+more|^\s*more\s*$/i;
+    /view\s+all|see\s+more|available\s+offers|show\s+more|read\s+more|^\s*more\s*$|^\s*specifications?\s*$|^read\s+all\s+specifications?\s*$/i;
   const useAnchors = platform !== "flipkart";
   const clickable = useAnchors
     ? page.locator('button, a, [role="button"], .a-button-text')
@@ -100,7 +110,7 @@ async function clickExpandables(
     const low = txt.toLowerCase();
     if (
       strong.test(low) ||
-      (/view|see|offer|more|all|emi/i.test(low) && !/buy now|add to cart/i.test(low))
+      (/view|see|offer|more|all|emi|\bspecifications?\b/i.test(low) && !/buy now|add to cart/i.test(low))
     ) {
       await el.click({ timeout: 1600 }).catch(() => {});
       await page.waitForTimeout(85);
@@ -115,6 +125,12 @@ async function clickExpandables(
     }
     await page.waitForTimeout(100);
   }
+  if (platform === "flipkart") {
+    await page.getByRole("tab", { name: /^specifications?$/i }).first().click({ timeout: 1200 }).catch(() => {});
+    await page.getByRole("button", { name: /^specifications?$/i }).first().click({ timeout: 1200 }).catch(() => {});
+    await page.getByRole("button", { name: /read\s+all\s+specifications?/i }).first().click({ timeout: 1200 }).catch(() => {});
+    await page.waitForTimeout(200);
+  }
 }
 
 async function runPlaywright(
@@ -122,28 +138,24 @@ async function runPlaywright(
   platform: ProductPayload["platform"],
   userAgent: string,
   takeScreenshot: boolean,
-  headed: boolean
+  headed: boolean,
+  proxy: ReturnType<typeof getPlaywrightProxyForAttempt>
 ): Promise<{ data: ProductPayload; screenshot_path: string | null }> {
-  const slowMo = resolveSlowMoMs();
-  const browser = await chromium.launch({
-    headless: !headed,
-    slowMo,
-    args: CHROMIUM_LAUNCH_ARGS,
-  });
+  void proxy;
+  let context: BrowserContext | null = null;
   let screenshot_path: string | null = null;
   let activePage: Page | undefined;
   try {
+    context = await launchChromePersistentContext();
     const headers = chromeLikeHeaders(userAgent);
-    const context = await browser.newContext({
-      userAgent,
-      locale: "en-IN",
-      timezoneId: "Asia/Kolkata",
-      viewport: { width: 1366, height: 900 },
-      extraHTTPHeaders: headers,
-    });
+    await context.setExtraHTTPHeaders(headers).catch(() => {});
     await applyStealthScripts(context);
 
-    const page = await context.newPage();
+    const existing = context.pages();
+    const page = existing.length > 0 ? existing[0]! : await context.newPage();
+    await page.setViewportSize({ width: 1366, height: 900 }).catch(() => {});
+    const cdp = await context.newCDPSession(page);
+    await cdp.send("Emulation.setUserAgentOverride", { userAgent }).catch(() => {});
     /* 3 s default: pages are already loaded before extraction, so 12 s stacks 40+ timeouts → multi-minute hangs. */
     page.setDefaultTimeout(3_000);
     page.setDefaultNavigationTimeout(50_000);
@@ -182,7 +194,7 @@ async function runPlaywright(
     if (activePage && pause > 0) {
       await activePage.waitForTimeout(pause).catch(() => {});
     }
-    await browser.close().catch(() => {});
+    await context?.close().catch(() => {});
   }
 }
 
@@ -213,8 +225,14 @@ function cheerioExtract(html: string, platform: ProductPayload["platform"]): Pro
   return p;
 }
 
-async function runCheerio(url: string, platform: ProductPayload["platform"]): Promise<ProductPayload> {
+async function runCheerio(
+  url: string,
+  platform: ProductPayload["platform"],
+  options?: { proxyUrl?: string }
+): Promise<ProductPayload> {
   const ua = getFallbackUserAgent(0);
+  const proxyUrl = options?.proxyUrl;
+  const agent = proxyUrl ? httpAgentForProxyUrl(proxyUrl) : undefined;
   const res = await axios.get<string>(url, {
     timeout: 18_000,
     headers: {
@@ -222,6 +240,7 @@ async function runCheerio(url: string, platform: ProductPayload["platform"]): Pr
       ...chromeLikeHeaders(ua),
     },
     validateStatus: () => true,
+    ...(agent ? { httpAgent: agent, httpsAgent: agent } : {}),
   });
   if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
   const html = res.data;
@@ -248,12 +267,14 @@ export async function scrapeProduct(
   try {
     const out = await withRetry(async (attempt) => {
       const ua = getPlaywrightUserAgent(attempt);
+      const proxy = getPlaywrightProxyForAttempt(attempt);
       const { data, screenshot_path } = await runPlaywright(
         url,
         platform,
         ua,
         takeScreenshot,
-        headed
+        headed,
+        proxy
       );
       if (!data.title && !data.price) throw new Error("Insufficient data from Playwright");
       if (data.title && /^access\s+denied$|^403\b|^blocked$|^sorry/i.test(data.title.trim())) {
@@ -272,7 +293,8 @@ export async function scrapeProduct(
   } catch (firstErr) {
     if (firstErr instanceof InvalidProductUrlError) throw firstErr;
     try {
-      const data = await runCheerio(url, platform);
+      const cheerioProxy = getAxiosProxyUrlForAttempt(MAX_SCRAPE_ATTEMPTS);
+      const data = await runCheerio(url, platform, { proxyUrl: cheerioProxy });
       if (!data.title && !data.price) {
         throw new Error("Cheerio fallback returned no product data — page may be blocked or requires JS");
       }

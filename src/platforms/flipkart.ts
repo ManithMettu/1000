@@ -9,6 +9,19 @@ async function closePopup(page: Page): Promise<void> {
   await page.waitForTimeout(100);
 }
 
+/**
+ * Flipkart often hides the spec grid behind a "Specifications" tab/button or
+ * "Read all specifications" — open it so DOM extraction can read rows/tables.
+ */
+async function revealSpecificationsSection(page: Page): Promise<void> {
+  await page.getByRole("tab", { name: /^specifications?$/i }).first().click({ timeout: 2000 }).catch(() => {});
+  await page.getByRole("button", { name: /^specifications?$/i }).first().click({ timeout: 2000 }).catch(() => {});
+  await page.getByRole("button", { name: /specifications?/i }).first().click({ timeout: 1500 }).catch(() => {});
+  await page.getByText(/^read\s+all\s+specifications?$/i).first().click({ timeout: 1500 }).catch(() => {});
+  await page.getByText(/read\s+all\s+specifications?/i).first().click({ timeout: 1200 }).catch(() => {});
+  await page.waitForTimeout(450);
+}
+
 interface FlipkartLD {
   name?: string;
   description?: string;
@@ -22,6 +35,7 @@ interface FlipkartLD {
 export async function scrapeFlipkart(page: Page): Promise<ProductPayload> {
   const p = emptyProduct("flipkart");
   await closePopup(page);
+  await revealSpecificationsSection(page);
 
   /* ── 1. JSON-LD structured data (most reliable, immune to DOM changes) ── */
   const ld: FlipkartLD | null = await page.evaluate(() => {
